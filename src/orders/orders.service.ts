@@ -9,9 +9,10 @@ import { CreateOrderDto } from './dto/create-order.dto';
 import { PrismaClient } from '@prisma/client';
 import { ClientProxy, RpcException } from '@nestjs/microservices';
 import { OrderPaginationDto } from './dto/order-pagination.dto';
-import { ChangeOrderStatusDto } from './dto';
+import { ChangeOrderStatusDto, PaidOrderDto } from './dto';
 import { NATS_SERVICE } from 'src/config';
 import { firstValueFrom } from 'rxjs';
+import { OrderWithProducts } from './entities/product.entity';
 
 type Product = {
   price: number;
@@ -22,9 +23,7 @@ type Product = {
 @Injectable()
 export class OrdersService extends PrismaClient implements OnModuleInit {
   private readonly logger = new Logger('ProductsService');
-  constructor(
-    @Inject(NATS_SERVICE) private readonly client: ClientProxy,
-  ) {
+  constructor(@Inject(NATS_SERVICE) private readonly client: ClientProxy) {
     super();
   }
 
@@ -80,6 +79,7 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
         })),
       };
     } catch (error) {
+      console.log(error);
       throw new RpcException({
         status: HttpStatus.BAD_REQUEST,
         message: 'Clear message for user :). Check logs.',
@@ -131,7 +131,10 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
     }
 
     const products: Product[] = await firstValueFrom(
-      this.client.send({ cmd: 'validate_products' }, order.OrderItem.map((it)=>it.productId)),
+      this.client.send(
+        { cmd: 'validate_products' },
+        order.OrderItem.map((it) => it.productId),
+      ),
     );
 
     return {
@@ -139,7 +142,7 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
       OrderItem: order.OrderItem.map((orderItem) => ({
         ...orderItem,
         name: products.find((product) => product.id === orderItem.productId)
-            .name,
+          .name,
       })),
     };
   }
@@ -156,6 +159,43 @@ export class OrdersService extends PrismaClient implements OnModuleInit {
       where: { id },
       data: { status },
     });
+  }
+
+  async createPaymentSession(order: OrderWithProducts) {
+    const paymentSession = await firstValueFrom(
+      this.client.send('create.payment.session', {
+        orderId: order.id,
+        currency: 'usd',
+        items: order.OrderItem.map((item) => ({
+          name: item.name,
+          price: item.price,
+          quantity: item.quantity,
+        })),
+      }),
+    );
+    return paymentSession;
+  }
+
+  async paidOrder (paidOrderDto: PaidOrderDto) {
+    this.logger.log('Order Paid');
+    this.logger.log(paidOrderDto);
+
+    const updatedOrder = await this.order.update({
+      where: {id: paidOrderDto.orderId},
+      data: {
+        status: 'PAID',
+        paid: true,
+        paidAt: new Date(),
+        stripeChargeId: paidOrderDto.stripePaymentId,
+        OrderReceipt: {
+          create: {
+            reciptUrl: paidOrderDto.reciptUrl
+          }
+        }
+      }
+    })
+
+    return updatedOrder;
   }
 
   private orderAmount(dto: CreateOrderDto, products: Product[]) {
